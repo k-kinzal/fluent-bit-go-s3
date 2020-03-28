@@ -1,6 +1,11 @@
 package main
 
-import "github.com/fluent/fluent-bit-go/output"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"github.com/fluent/fluent-bit-go/output"
+)
 import "github.com/json-iterator/go"
 import "github.com/aws/aws-sdk-go/aws"
 import "github.com/aws/aws-sdk-go/aws/awserr"
@@ -30,13 +35,14 @@ func init() {
 }
 
 type s3operator struct {
-	bucket         string
-	prefix         string
-	uploader       *s3manager.Uploader
-	compressFormat format
-	logger         *log.Logger
-	timeFormat     string
-	location       *time.Location
+	bucket          string
+	prefix          string
+	suffixAlgorithm algorithm
+	uploader        *s3manager.Uploader
+	compressFormat  format
+	logger          *log.Logger
+	timeFormat      string
+	location        *time.Location
 }
 
 type GoOutputPlugin interface {
@@ -174,6 +180,7 @@ func newS3Output(ctx unsafe.Pointer, operatorID int) (*s3operator, error) {
 	secretAccessKey := plugin.PluginConfigKey(ctx, "SecretAccessKey")
 	bucket := plugin.PluginConfigKey(ctx, "Bucket")
 	s3prefix := plugin.PluginConfigKey(ctx, "S3Prefix")
+	suffixAlgorithm := plugin.PluginConfigKey(ctx, "SuffixAlgorithm")
 	region := plugin.PluginConfigKey(ctx, "Region")
 	compress := plugin.PluginConfigKey(ctx, "Compress")
 	endpoint := plugin.PluginConfigKey(ctx, "Endpoint")
@@ -182,7 +189,8 @@ func newS3Output(ctx unsafe.Pointer, operatorID int) (*s3operator, error) {
 	timeFormat := plugin.PluginConfigKey(ctx, "TimeFormat")
 	timeZone := plugin.PluginConfigKey(ctx, "TimeZone")
 
-	config, err := getS3Config(accessKeyID, secretAccessKey, credential, s3prefix, bucket, region, compress, endpoint, autoCreateBucket, logLevel, timeFormat, timeZone)
+	config, err := getS3Config(accessKeyID, secretAccessKey, credential, s3prefix, suffixAlgorithm, bucket, region, compress, endpoint, autoCreateBucket, logLevel, timeFormat, timeZone)
+
 	if err != nil {
 		return nil, err
 	}
@@ -229,13 +237,14 @@ func newS3Output(ctx unsafe.Pointer, operatorID int) (*s3operator, error) {
 	})
 
 	s3operator := &s3operator{
-		bucket:         *config.bucket,
-		prefix:         *config.s3prefix,
-		uploader:       uploader,
-		compressFormat: config.compress,
-		logger:         logger,
-		timeFormat:     config.timeFormat,
-		location:       config.location,
+		bucket:          *config.bucket,
+		prefix:          *config.s3prefix,
+		suffixAlgorithm: config.suffixAlgorithm,
+		uploader:        uploader,
+		compressFormat:  config.compress,
+		logger:          logger,
+		timeFormat:      config.timeFormat,
+		location:        config.location,
 	}
 
 	return s3operator, nil
@@ -304,7 +313,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		lines += line + "\n"
 	}
 
-	objectKey := GenerateObjectKey(s3operator, time.Now())
+	objectKey := GenerateObjectKey(s3operator, time.Now(), lines)
 	err := plugin.Put(s3operator, objectKey, time.Now(), lines)
 	if err != nil {
 		s3operator.logger.Warnf("error sending message for S3: %v", err)
@@ -320,7 +329,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 }
 
 // format is S3_PREFIX/S3_TRAILING_PREFIX/date/hour/timestamp_uuid.log
-func GenerateObjectKey(s3operator *s3operator, t time.Time) string {
+func GenerateObjectKey(s3operator *s3operator, t time.Time, lines string) string {
 	var fileext string
 	switch s3operator.compressFormat {
 	case plainTextFormat:
@@ -328,11 +337,19 @@ func GenerateObjectKey(s3operator *s3operator, t time.Time) string {
 	case gzipFormat:
 		fileext = ".log.gz"
 	}
+	var suffix string
+	switch s3operator.suffixAlgorithm {
+	case noSuffixAlgorithm:
+		suffix = ""
+	case sha256SuffixAlgorithm:
+		b := sha256.Sum256([]byte(lines))
+		suffix = fmt.Sprintf("-%s", hex.EncodeToString(b[:]))
+	}
 	// Convert time.Time object's Local with specified TimeZone's
 	time.Local = s3operator.location
 	timestamp := t.Local().Format("20060102150405")
 
-	fileName := strings.Join([]string{timestamp, fileext}, "")
+	fileName := strings.Join([]string{timestamp, suffix, fileext}, "")
 
 	objectKey := filepath.Join(s3operator.prefix, t.Local().Format(s3operator.timeFormat), fileName)
 	return objectKey
